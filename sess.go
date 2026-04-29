@@ -224,7 +224,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		sess.headerSize += fecHeaderSizePlus2
 	}
 
-	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
+	sess.kcp = NewKCP(uint16(conv), func(buf []byte, size int) {
 		// A basic check for the minimum packet size
 		if size >= IKCP_OVERHEAD {
 			// make a copy
@@ -816,7 +816,7 @@ func (s *UDPSession) update() {
 }
 
 // GetConv gets conversation id of a session
-func (s *UDPSession) GetConv() uint32 { return s.kcp.conv }
+func (s *UDPSession) GetConv() uint32 { return uint32(s.kcp.conv) }
 
 // GetRTO gets current rto of the session
 func (s *UDPSession) GetRTO() uint32 {
@@ -909,7 +909,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// s.headerSize includes the space needed by the FEC encoder.
 	buf := defaultBufferPool.Get()[:size+s.headerSize]
 	// Encode conversation ID.
-	binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
+	binary.LittleEndian.PutUint32(buf[s.headerSize:], uint32(s.kcp.conv))
 
 	// Copy OOB payload immediately after the conversation ID.
 	copy(buf[s.headerSize+convSize:], data)
@@ -1238,7 +1238,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	if exist {
 		// If we have a valid conversation id or we cannot get conversation id from the packet,
 		// just feed the data into the existing session.
-		if !hasConv || conv == s.kcp.conv {
+		if !hasConv || conv == uint32(s.kcp.conv) {
 			s.kcpInput(data)
 			return
 		}
