@@ -79,6 +79,13 @@ const (
 	// conversation ID field size (bytes)
 	convSize = 4
 
+	// wire frame header: kind(1) + payload size(2)
+	wireFrameHeaderSize = 3
+
+	// framed packet kinds
+	wireFrameRaw = 1
+	wireFrameFEC = 2
+
 	// accept backlog: max pending connections for Listener
 	acceptBacklog = 128
 
@@ -135,13 +142,14 @@ type (
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr     // remote peer address
-		rd         atomic.Value // read deadline
-		wd         atomic.Value // write deadline
-		headerSize int          // the header size additional to a KCP frame
-		ackNoDelay bool         // send ack immediately for each incoming packet(testing purpose)
-		writeDelay bool         // delay kcp.flush() for Write() for bulk transfer
-		dup        int          // duplicate udp packets(testing purpose)
+		remote            net.Addr     // remote peer address
+		rd                atomic.Value // read deadline
+		wd                atomic.Value // write deadline
+		frameHeaderOffset int          // offset of the session wire-frame header after optional crypto headers
+		headerSize        int          // the header size additional to a KCP frame
+		ackNoDelay        bool         // send ack immediately for each incoming packet(testing purpose)
+		writeDelay        bool         // delay kcp.flush() for Write() for bulk transfer
+		dup               int          // duplicate udp packets(testing purpose)
 
 		// notifications
 		die          chan struct{} // notify current session has Closed
@@ -208,12 +216,13 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	// calculate additional header size introduced by encryption
 	switch block := sess.block.(type) {
 	case nil:
-		sess.headerSize = 0
+		sess.frameHeaderOffset = 0
 	case *aeadCrypt:
-		sess.headerSize = block.NonceSize()
+		sess.frameHeaderOffset = block.NonceSize()
 	default:
-		sess.headerSize = cryptHeaderSize
+		sess.frameHeaderOffset = cryptHeaderSize
 	}
+	sess.headerSize = sess.frameHeaderOffset + wireFrameHeaderSize
 
 	// FEC codec initialization
 	sess.fecDecoder = newFECDecoder(dataShards, parityShards)
@@ -224,7 +233,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		sess.headerSize += fecHeaderSizePlus2
 	}
 
-	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
+	sess.kcp = NewKCP(uint16(conv), func(buf []byte, size int) {
 		// A basic check for the minimum packet size
 		if size >= IKCP_OVERHEAD {
 			// make a copy
@@ -699,6 +708,12 @@ func (s *UDPSession) postProcess() {
 				} else {
 					s.fecEncoder.encodeOOB(buf)
 				}
+				writeWireFrameHeader(buf, s.frameHeaderOffset, wireFrameFEC)
+				for k := range ecc {
+					writeWireFrameHeader(ecc[k], s.frameHeaderOffset, wireFrameFEC)
+				}
+			} else {
+				writeWireFrameHeader(buf, s.frameHeaderOffset, wireFrameRaw)
 			}
 
 			// --- Stage 2: Encryption ---
@@ -816,7 +831,7 @@ func (s *UDPSession) update() {
 }
 
 // GetConv gets conversation id of a session
-func (s *UDPSession) GetConv() uint32 { return s.kcp.conv }
+func (s *UDPSession) GetConv() uint32 { return uint32(s.kcp.conv) }
 
 // GetRTO gets current rto of the session
 func (s *UDPSession) GetRTO() uint32 {
@@ -909,7 +924,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// s.headerSize includes the space needed by the FEC encoder.
 	buf := defaultBufferPool.Get()[:size+s.headerSize]
 	// Encode conversation ID.
-	binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
+	binary.LittleEndian.PutUint32(buf[s.headerSize:], uint32(s.kcp.conv))
 
 	// Copy OOB payload immediately after the conversation ID.
 	copy(buf[s.headerSize+convSize:], data)
@@ -928,6 +943,65 @@ func (s *UDPSession) SendOOB(data []byte) error {
 		// OOB delivery is best-effort by design.
 		defaultBufferPool.Put(buf)
 		return nil
+	}
+}
+
+func writeWireFrameHeader(buf []byte, offset int, kind uint8) {
+	buf[offset] = kind
+	binary.LittleEndian.PutUint16(buf[offset+1:], uint16(len(buf)-offset-wireFrameHeaderSize))
+}
+
+func extractWireFrame(data []byte) (kind uint8, payload []byte, ok bool) {
+	if len(data) < wireFrameHeaderSize {
+		return 0, nil, false
+	}
+
+	size := int(binary.LittleEndian.Uint16(data[1:]))
+	end := wireFrameHeaderSize + size
+	if end > len(data) {
+		return 0, nil, false
+	}
+
+	return data[0], data[wireFrameHeaderSize:end], true
+}
+
+func (s *UDPSession) inputRawKCPPacket(data []byte) {
+	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
+	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
+		atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+	}
+
+	if n := s.kcp.PeekSize(); n > 0 {
+		s.notifyReadEvent()
+	}
+
+	waitsnd := s.kcp.WaitSnd()
+	if waitsnd < int(s.kcp.snd_wnd) {
+		s.notifyWriteEvent()
+	}
+}
+
+func (s *UDPSession) inputWirePacket(kind uint8, data []byte) {
+	switch kind {
+	case wireFrameRaw:
+		if len(data) < IKCP_OVERHEAD {
+			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+			return
+		}
+		s.inputRawKCPPacket(data)
+	case wireFrameFEC:
+		if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+			return
+		}
+		s.kcpInput(data)
+	default:
+		atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
 	}
 }
 
@@ -1004,120 +1078,125 @@ func (s *UDPSession) packetInput(data []byte) {
 		data = data[crcSize:]
 	}
 
-	// basic check for minimum packet size
-	// NOTE: OOB allows sending small packets and even empty packets.
-	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	kind, payload, ok := extractWireFrame(data)
+	if !ok {
 		atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
 		return
 	}
 
-	s.kcpInput(data)
+	s.inputWirePacket(kind, payload)
+}
+
+func looksLikeKCPPacket(data []byte) bool {
+	return len(data) >= IKCP_OVERHEAD && (data[2] == IKCP_CMD_PUSH || data[2] == IKCP_CMD_ACK)
+}
+
+func detectFECPacket(data []byte) (uint16, bool) {
+	if len(data) < fecHeaderSizePlus2 {
+		return 0, false
+	}
+
+	flag := binary.LittleEndian.Uint16(data[4:])
+	switch flag {
+	case typeData, typeOOB:
+		size := binary.LittleEndian.Uint16(data[6:])
+		if size >= 2 && int(fecHeaderSize)+int(size) <= len(data) {
+			return flag, true
+		}
+	case typeParity:
+		return flag, true
+	}
+
+	return 0, false
 }
 
 // kcpInput routes a decrypted packet into the KCP state machine,
 // handling FEC decoding and OOB delivery.
 //
-// Packet demultiplexing uses the 16-bit field at offset 4:
-//   - 0xf1 (typeData) / 0xf2 (typeParity): FEC-encoded packet
-//   - 0xf3 (typeOOB): out-of-band packet (unreliable, bypasses KCP)
-//   - other values: raw KCP packet (no FEC)
+// Raw KCP packets are identified by the 8-byte header shape:
+// conv(2) + cmd(1) + frg(1) + sn(2) + una(2).
 //
-// Note: KCP cmd values [81-84] with frg [0-255] do not collide with
-// FEC type markers 0x00f1/0x00f2/0x00f3 in little-endian.
+// FEC data and OOB packets are identified by the FEC type at offset 4 plus
+// the exact size field match at offset 6. Parity packets have no size field,
+// so they are treated as FEC only when the packet does not also look like raw KCP.
 func (s *UDPSession) kcpInput(data []byte) {
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
 
-	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
-	fecFlag := binary.LittleEndian.Uint16(data[4:])
+	if fecFlag, ok := detectFECPacket(data); ok {
+		switch fecFlag {
+		case typeData, typeParity: // packet with FEC
+			var kcpInErrors uint64
+			f := fecPacket(data)
 
-	switch fecFlag {
-	case typeData, typeParity: // packet with FEC
-		if len(data) < fecHeaderSizePlus2 {
-			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
-			return
-		}
+			// lock
+			s.mu.Lock()
+			defer s.mu.Unlock()
 
-		var kcpInErrors uint64
-		f := fecPacket(data)
-
-		// lock
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		// if fecDecoder is not initialized, create one with default parameter
-		// lazy initialization
-		if s.fecDecoder == nil {
-			s.fecDecoder = newFECDecoder(1, 1)
-		}
-
-		// KCP input for data packets
-		// only data packets are fed into kcp directly
-		// parity packets are only used for recovery
-		if f.flag() == typeData {
-			if ret := s.kcp.Input(data[fecHeaderSizePlus2:], IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
-				kcpInErrors++
+			// if fecDecoder is not initialized, create one with default parameter
+			// lazy initialization
+			if s.fecDecoder == nil {
+				s.fecDecoder = newFECDecoder(1, 1)
 			}
-		}
 
-		// FEC decoding
-		// If there're some packets recovered from FEC, feed them into kcp
-		recovers := s.fecDecoder.decode(f)
-		for _, r := range recovers {
-			if len(r) >= 2 { // must be larger than 2bytes
-				sz := binary.LittleEndian.Uint16(r)
-				if int(sz) <= len(r) && sz >= 2 {
-					if ret := s.kcp.Input(r[2:sz], IKCP_PACKET_FEC, s.ackNoDelay); ret != 0 {
-						kcpInErrors++
-					}
+			// KCP input for data packets
+			// only data packets are fed into kcp directly
+			// parity packets are only used for recovery
+			if f.flag() == typeData {
+				end := fecHeaderSize + int(binary.LittleEndian.Uint16(data[fecHeaderSize:]))
+				if ret := s.kcp.Input(data[fecHeaderSizePlus2:end], IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
+					kcpInErrors++
 				}
 			}
-			// recycle the buffer
-			defaultBufferPool.Put(r)
-		}
 
-		// to notify the readers to receive the data if there's any
-		if n := s.kcp.PeekSize(); n > 0 {
-			s.notifyReadEvent()
-		}
+			// FEC decoding
+			// If there're some packets recovered from FEC, feed them into kcp
+			recovers := s.fecDecoder.decode(f)
+			for _, r := range recovers {
+				if len(r) >= 2 { // must be larger than 2bytes
+					sz := binary.LittleEndian.Uint16(r)
+					if int(sz) <= len(r) && sz >= 2 {
+						if ret := s.kcp.Input(r[2:sz], IKCP_PACKET_FEC, s.ackNoDelay); ret != 0 {
+							kcpInErrors++
+						}
+					}
+				}
+				// recycle the buffer
+				defaultBufferPool.Put(r)
+			}
 
-		// to notify the writers if the window size allows to send more packets
-		// and the remote window size is not full.
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
-			s.notifyWriteEvent()
-		}
+			// to notify the readers to receive the data if there's any
+			if n := s.kcp.PeekSize(); n > 0 {
+				s.notifyReadEvent()
+			}
 
-		if kcpInErrors > 0 {
-			atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
-		}
-	case typeOOB:
+			// to notify the writers if the window size allows to send more packets
+			// and the remote window size is not full.
+			waitsnd := s.kcp.WaitSnd()
+			if waitsnd < int(s.kcp.snd_wnd) {
+				s.notifyWriteEvent()
+			}
+
+			if kcpInErrors > 0 {
+				atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
+			}
+		case typeOOB:
 		// Count received OOB packet
 		atomic.AddUint64(&DefaultSnmp.OOBPackets, 1)
 		// If an OOB callback is registered, invoke it synchronously.
 		// The callback is responsible for ensuring non-blocking behavior.
 		if callback := s.callbackForOOB.Load(); callback != nil {
+			end := fecHeaderSize + int(binary.LittleEndian.Uint16(data[fecHeaderSize:]))
+			if end < fecHeaderSizePlus2+convSize {
+				return
+			}
 			// Data layout: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
-			callback.(OOBCallBackType)(data[fecHeaderSizePlus2+convSize:])
+			callback.(OOBCallBackType)(data[fecHeaderSizePlus2+convSize : end])
 		}
-	default: // packet without FEC
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
-			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
-		}
-
-		if n := s.kcp.PeekSize(); n > 0 {
-			s.notifyReadEvent()
-		}
-
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
-			s.notifyWriteEvent()
 		}
 		return
 	}
+	atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
 }
 
 // -----------------------------------------------------------------------
@@ -1189,57 +1268,65 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		data = data[crcSize:]
 	}
 
-	// basic check for minimum packet size
-	// NOTE: OOB allows sending small packets and even empty packets.
-	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	kind, payload, ok := extractWireFrame(data)
+	if !ok {
 		return
 	}
+	data = payload
 
 	// look for existing session
 	l.sessionLock.RLock()
 	s, exist := l.sessions[addr.String()]
 	l.sessionLock.RUnlock()
 
-	var conv, sn uint32
+	var conv uint32
+	var sn uint16
 	hasConv := false
 
-	// try to get conversation id from the packet
-	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
-	fecFlag := binary.LittleEndian.Uint16(data[4:])
-
-	switch fecFlag {
-	case typeData:
-		// data packet of FEC, conversation id inside
-		if len(data) < fecHeaderSizePlus2+IKCP_OVERHEAD {
-			break
-		}
-
-		hasConv = true
-		conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
-		sn = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:])
-	case typeParity:
-		// parity packet of FEC, conversation id inside
-	case typeOOB:
-		// OOB packets always carry the conversation ID immediately after the FEC header.
-		hasConv = true
-		// Data layout: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
-		conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
-	default:
-		// packet without FEC
+	switch kind {
+	case wireFrameRaw:
 		if len(data) < IKCP_OVERHEAD { // basic check for minimum kcp packet size
 			return
 		}
 		hasConv = true
-		conv = binary.LittleEndian.Uint32(data)
-		sn = binary.LittleEndian.Uint32(data[IKCP_SN_OFFSET:])
+		conv = uint32(binary.LittleEndian.Uint16(data))
+		sn = binary.LittleEndian.Uint16(data[IKCP_SN_OFFSET:])
+	case wireFrameFEC:
+		if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+			return
+		}
+		if fecFlag, ok := detectFECPacket(data); ok {
+			switch fecFlag {
+			case typeData:
+				// data packet of FEC, conversation id inside
+				if len(data) < fecHeaderSizePlus2+IKCP_OVERHEAD {
+					break
+				}
+
+				hasConv = true
+				conv = uint32(binary.LittleEndian.Uint16(data[fecHeaderSizePlus2:]))
+				sn = binary.LittleEndian.Uint16(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:])
+			case typeParity:
+				// parity packet of FEC, conversation id inside
+			case typeOOB:
+				// OOB packets always carry the conversation ID immediately after the FEC header.
+				hasConv = true
+				// Data layout: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
+				conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+			}
+		} else {
+			return
+		}
+	default:
+		return
 	}
 
 	// on an existing connection
 	if exist {
 		// If we have a valid conversation id or we cannot get conversation id from the packet,
 		// just feed the data into the existing session.
-		if !hasConv || conv == s.kcp.conv {
-			s.kcpInput(data)
+		if !hasConv || conv == uint32(s.kcp.conv) {
+			s.inputWirePacket(kind, data)
 			return
 		}
 		// conversation id mismatched, only accept reset packet with sn == 0
@@ -1265,7 +1352,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 
 	// new session
 	s = newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, addr, l.block)
-	s.kcpInput(data)
+	s.inputWirePacket(kind, data)
 	l.sessionLock.Lock()
 	l.sessions[addr.String()] = s
 	l.sessionLock.Unlock()
